@@ -1,0 +1,97 @@
+Build a comprehensive Canadian mortgage analyzer Streamlit app (single file app.py). 
+Here are the complete requirements:
+
+TECH STACK: Python, Streamlit, Pandas, NumPy, Plotly, python-dateutil, uuid, json. 
+Optional MS SQL Server via pyodbc (degrades gracefully to local mode).
+
+DEFAULTS: DB server=localhost\SQLEXPRESS, DB=MortgageDB, Windows Auth.
+Mortgage defaults: Purchase $1,030,000 | Down 20% | Rate 5.39% | Amort 30yr | Term 3yr | Start 2023-08-15 | Monthly payments | Fixed.
+
+MATH: Canadian semi-annual compounding (Interest Act). 
+periodic_rate(r, n) = ((1 + r/200)**2)**(1/n) - 1   [NOTE: two-step — parenthesize carefully]
+Accelerated bi-weekly = monthly÷2 paid every 2 weeks.
+CMHC: 4%/3.1%/2.8% for <10%/<15%/<20% down, price ≤$1.5M.
+date_to_period(target, start, n) = max(1, round((target-start).days / 365.25 * n))
+build_amortization(principal, rate, n_per_year, amort_years, accel, start_date, extra_payments, rate_changes, term_periods) → (DataFrame, summary_dict)
+Break penalty: Variable=3mo interest; Fixed=max(3mo interest, IRD). IRD=(orig_posted-curr_posted)/100 * balance * months_left/12.
+
+DB TABLES: mortgage_scenarios(id, name, created_at, params NVARCHAR(MAX), summary NVARCHAR(MAX)), mortgage_setup(id, setup_name, saved_at, setup_data NVARCHAR(MAX)).
+
+SESSION STATE: db_conn, saved_scenarios{}, rc_scenarios{}, past_prepayments[], past_renewals[], setup_save_name.
+
+SIDEBAR: DB connect form (server, database, Windows auth checkbox, username/password if not Windows auth), Connect button, Load saved setup dropdown (from mortgage_setup table), Canadian mortgage rules reference expander, CMHC rates table expander.
+
+7 TABS:
+
+TAB1 (Setup & Overview):
+- Property section: purchase price, down payment % slider, auto-calculated down $ and CMHC premium (with "add to mortgage" checkbox). CMHC rates: <10%=4%, <15%=3.1%, <20%=2.8%, ≥20%=0%. PST/HST 13% on premium shown.
+- Original mortgage term: type (Fixed/Variable), payment frequency (Monthly/Semi-Monthly/Bi-Weekly/Accelerated Bi-Weekly/Weekly/Accelerated Weekly), rate, amortization slider, term selectbox [0.5,1,2,3,4,5,7,10], start date.
+- Key Metrics panel (right column): regular metric cards for principal, payment, balance at term end, plus 3 GREEN-bordered "as of today" cards: balance today, principal paid today, interest paid today (use get_today_metrics(df) that finds last row where Date<=today). Also total interest, interest %, effective payoff years.
+- Two charts: principal vs interest donut + yearly stacked bar (mark past renewal dates as vertical dotted lines).
+- "Additional Mortgage Terms" section: button to add past renewals. Each row: start date, rate, type, term years → auto-shows end date. Deletable. These become rate_changes[] in the base amortization.
+- "Past Prepayments" section: button to add. Each row: exact date, amount. date_to_period() converts to period. Deletable.
+- "Save This Setup" section: name input + Save to DB button. Saves widget state + past_renewals + past_prepayments + summary as JSON to mortgage_setup.
+- Store st.session_state["base"] = {principal, annual_rate, n_py, amort_years, accel, start_date, mortgage_type, term_years, payment_freq, purchase_price, down_payment, past_extra, past_renewal_rcs}.
+
+TAB2 (Amortization Schedule):
+- Radio: All Periods / Monthly Summary / Yearly Summary.
+- Checkbox: show current term only.
+- Checkbox: highlight current month (default True). Highlight using pandas Styler.apply() — yellow background #FFF3CD bold on the row matching current year-month.
+- Show info bar with current period number and balance when today is found.
+- Balance chart with "Today" vertical line.
+- CSV download button.
+
+TAB3 (Rate Change Scenarios):
+- Info message explaining what the tab does.
+- "New Scenario" button → adds to rc_scenarios{} in session state.
+- Each scenario shown as st.expander (NOT nested — use st.checkbox for sub-sections).
+- Scenario has: name, description text inputs; delete button.
+- "Show quick templates" CHECKBOX (not expander!) — shows template selectbox + Apply button.
+- Templates: +1%/-1%/+2%/-2% at renewal, Variable at renewal, BoC hike then cut, Gradual rise, Flat.
+- "Add Renewal Entry" button → each renewal has: mode radio (By Date / By Period), date picker OR period number (both show the approx equivalent), mortgage type (Fixed/Variable), rate, term years selectbox.
+- Show term start date and end date (period_to_date helper).
+- EARLY RENEWAL DETECTION: if renewal period < previous term end period → show warning, auto-lookup balance+rate from base schedule at that period, show break penalty (orig posted rate, curr posted rate inputs), misc fees, monthly saving and months-to-recoup.
+- Normal renewals: just misc fees input.
+- Results: 4 metrics (base vs scenario interest and payoff), balance chart with renewal markers (red for early, orange for normal), rate-over-time chart.
+- Save button → stores to saved_scenarios and optionally DB.
+
+TAB4 (Prepayment Analysis):
+- Rate scenario selector (dropdown of saved rate_change type scenarios + "Base Rate").
+- Annual lump-sum: amount, month, start year, years.
+- Lender limit % slider + warning if exceeded.
+- Increased regular payments: Fixed $/% increase/None radio.
+- One-time lump sum: by date or period.
+- Combines past_extra + future_extra + active_rate_changes.
+- 3-line chart: base (grey dotted), rate scenario no prepayments (red), rate scenario + prepayments (green). Mark lump-sum periods as blue dotted vlines, rate changes as orange dashed vlines.
+- Cumulative interest comparison chart.
+- 5 metrics: interest (rate scenario), interest (+prepayments), payoff (rate sc), payoff (+prepayments), total new prepayments.
+- ROI calculation: interest saved / total prepaid.
+- Save button.
+
+TAB5 (Break Penalty):
+- Inputs: outstanding balance, contract rate, Fixed/Variable selectbox (key="bp_mtype_tab5"), months remaining.
+- Misc fees input (admin/appraisal/legal).
+- If Fixed: orig posted rate + curr posted rate inputs.
+- Results: 3-months interest, IRD (if fixed), penalty owing, total exit cost (penalty + misc).
+- Break-even analysis: new rate slider, compare stay vs break interest costs.
+- Net savings chart sweeping new rate from 0.5% to current rate.
+- Monthly payment change and months to recoup calculation.
+
+TAB6 (Scenario Comparison):
+- 2/3/4 scenario columns radio.
+- Each: label, rate, amortization, frequency, annual lump sum.
+- Comparison table, balance chart, total interest bar chart, payment composition pie subplots.
+- Best scenario callout.
+
+TAB7 (Saved Scenarios):
+- Shows DB scenarios + local saved_scenarios{}.
+- Each in expander: 4 metrics, "Show raw params" CHECKBOX (not nested expander), delete from DB button.
+- Export all as CSV.
+- Canadian mortgage education section: semi-annual compounding math, CMHC table, break penalty explanation.
+
+UNIQUE KEYS: every single Streamlit widget must have an explicit unique key= parameter. For dynamically created widgets (in loops), use the item's uuid-based id in the key. Never let two widgets share the same key.
+
+COLORS: principal=#1a3c5e, interest=#e74c3c, prepayment=#3498db, savings=#27ae60, today-metrics=green border (#27ae60).
+
+Run with: streamlit run app.py
+Run with: streamlit run app.py
