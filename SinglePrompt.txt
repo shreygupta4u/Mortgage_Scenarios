@@ -1,134 +1,15 @@
-Build a single-file Canadian Mortgage Analyzer Streamlit app (app.py). Full specification:
-
-STACK: Python, Streamlit, Pandas, NumPy, Plotly, python-dateutil, uuid, json, math.
-MS SQL Server via pyodbc — MANDATORY, no optional mode.
-
-DEFAULTS: DB server=localhost\\SQLEXPRESS, DB=MortgageDB, Windows Auth.
-Mortgage: Price=$1,030,000 | Down=20% | Rate=5.39% | Amort=30yr | Term=3yr | Start=2023-08-15 | Monthly | Fixed.
-
-MATH (Canadian semi-annual compounding — Interest Act):
-  periodic_rate(annual_pct, n):
-    eff_annual = (1 + annual_pct/200)**2      # TWO STEPS — parenthesize carefully
-    return eff_annual**(1/n) - 1
-  calc_pmt(principal, rate, n, amort_years, accel=False) → standard annuity
-  Accelerated bi-weekly = monthly_pmt / 2 paid every 2 weeks
-  CMHC: <10%=4%, <15%=3.1%, <20%=2.8%, >=20%=0%. Price <=1.5M. PST/HST 13% on premium.
-  date_to_period(target, start, n) = max(1, round((target-start).days / 365.25 * n))
-  period_to_date(period, start, n): n=12→+months, n=24→+15days, n=26→+2weeks, n=52→+1week
-  build_amortization(principal, rate, n, amort_years, accel, start_date,
-                     extra_payments, rate_changes, term_periods) → (DataFrame, summary_dict)
-  get_today_metrics(df, n): last row where Date<=today → balance_today, principal_paid_today,
-    interest_paid_today, period_today, remaining_years=(len(df)-period_today)/n
-    CRITICAL: include past_extra in full_df before calling get_today_metrics
-  calc_remaining_years(balance, rate, n, payment): log formula
-  calc_break_penalty(bal, rate, mtype, orig_posted, curr_posted, months_left):
-    returns {3_months_interest, ird (Fixed only), calc_penalty, method}
-  stacked_bar_pi(df, today_p, term_end_p, title): Plotly stacked bar chart
-    3 segments by period: past (grey), current-term (blue/red), post-term (faded)
-    Aggregated by Year. Returns go.Figure with barmode="stack".
-  _vline_x(v): convert date to ms-epoch for Plotly add_vline on date axis.
-
-DB TABLES: mortgage_setup (single row, no name), mortgage_scenarios(id,name,created_at,params,summary)
-db_save_setup: DELETE all rows then INSERT one (no setup name)
-db_load_setup: SELECT TOP 1 setup_data FROM mortgage_setup ORDER BY id DESC
-
-SESSION STATE: db_conn, setup_loaded, setup_data, saved_scenarios{}, rc_scenarios{},
-               past_prepayments[], past_renewals[], base{}
-
-GATE 1 — DB CONNECTION (full-page form, not sidebar):
-  If st.session_state.db_conn is None: show centered connection form, st.stop()
-  On connect: call _init_db, then db_load_setup; if data found → set setup_data + setup_loaded=True
-
-GATE 2 — SETUP REQUIRED:
-  def require_setup(): if not st.session_state.get("base"): st.info(...); st.stop()
-  Call require_setup() at top of tabs 2-7.
-
-7 TABS:
-
-TAB1 (Setup & Overview):
-  - Property: price, down%, CMHC advisory
-  - Original term: type, freq, rate, amort, term, start_date
-  - Populate widget defaults from db_load_setup if available, else hardcoded defaults
-  - Past Renewals: add/delete (start_date, rate, type, term) → show end date → past_renewal_rcs
-  - Past Prepayments: add/delete (exact date, amount) → date_to_period → past_extra
-  - Build full_df WITH past_extra before calling get_today_metrics
-  - Key Metrics right column: principal, payment, balance@term_end,
-    3 GREEN cards: balance_today, principal_paid_today, interest_paid_today,
-    remaining_amortization (from today), current_monthly_payment (on remaining balance+remaining amort),
-    total interest, interest %, original payoff
-  - Charts: principal vs interest donut + stacked_bar_pi (three-layer P&I)
-  - Save Setup button → db_save_setup (single row, no name)
-  - Store st.session_state["base"] dict
-
-TAB2 (Amortization Schedule):
-  - View mode: All Periods / Monthly / Yearly
-  - Checkbox: "Show full schedule" (default False) → if False, slice df from (today_period - 3)
-    so the table starts near the current date (FIX: auto-scroll to today)
-  - Highlight current month: yellow #FFF3CD via pandas Styler.apply()
-  - Balance chart with date x-axis, "Today" vline using _vline_x()
-  - CSV download
-
-TAB3 (Rate Change Scenarios):
-  - New Scenario button → rc_scenarios{} session state
-  - Each scenario: name, description, list of renewals
-  - Quick templates via st.checkbox (NOT nested expander)
-  - Each renewal: mode (By Date/By Period), type (Fixed/Variable), rate, term
-    Show term start+end dates. 
-  - EARLY RENEWAL DETECTION: if period < prev_term_end_p:
-    → Show orig_posted + curr_posted inputs
-    → Show ADVISORY info box with 3mo interest, IRD, calculated max
-    → Show st.radio with choices: "3-Month Interest ($X)", "IRD ($X)", "Custom value"
-      (FIX: user picks which to apply, or enters custom; no auto-apply)
-    → Misc fees input; total exit cost; break-even months
-  - NO custom payment override input; instead show:
-    sc_pmt = calc_pmt(today_balance, last_renewal_rate, n_py, rem_yrs, accel)
-    Display as metric "Payment at renewal rate"
-  - Results: 5 metrics (base interest, scenario interest, base remaining, scenario remaining,
-    payment at renewal rate)
-    CRITICAL: remaining = (len(df) - today_period) / n_py — NOT original amort_years
-  - stacked_bar_pi chart per scenario (three segments)
-  - Rate over time chart (date x-axis)
-  - Variable sub-scenarios (a,b,c): add sub-scenario button, n_changes, date+rate per change
-  - Save button → saved_scenarios{} + DB
-
-TAB4 (Prepayment Analysis):
-  - Rate scenario selector (saved rate_change scenarios + base)
-  - Annual lump-sum, regular payment increase, one-time
-  - stacked_bar_pi chart for with-prepayment schedule
-  - 6 metrics including remaining years
-  - Save button
-
-TAB5 (Break Penalty):
-  - Inputs: balance, rate, type selectbox (key="bp_mtype_tab5"), months remaining, misc fees
-  - If Fixed: orig_posted + curr_posted inputs
-  - ADVISORY info: show 3mo interest, IRD, calculated max
-  - st.radio "Apply which penalty?" with options:
-    "3-Month Interest ($X)", "IRD ($X)" (if fixed), "Custom value"
-    (FIX: user chooses, or enters custom amount)
-  - Total exit cost = chosen_penalty + misc_fees
-  - Break-even: new rate slider, stay vs break comparison, net savings chart, recoup months
-
-TAB6 (Scenario Comparison):
-  - 2/3/4 scenarios; each: label, rate, amort, freq, annual lump
-  - NO custom payment override
-  - Show "Original Payment" and "Current Payment (on remaining balance)" separately
-  - "Remaining" column = calculated from today, not original amort_years
-  - Balance chart (date x-axis)
-  - Stacked bar P&I comparison (grouped by scenario + year)
-
-TAB7 (Saved Scenarios):
-  - DB + local scenarios; each in expander
-  - "Show raw params" CHECKBOX (NOT nested expander)
-  - Delete from DB button
-  - Export CSV
-  - Education: semi-annual compounding, CMHC, break penalty
-  - Downloadable prompt.txt file (NOT displayed on screen — FIX)
-    Use st.download_button with the full prompt text as a .txt file
-
-UNIQUE KEYS: every widget has explicit unique key=. Loop widgets use uuid IDs.
-NO NESTED EXPANDERS: use st.checkbox for sub-sections within expanders.
-ALL CHARTS: use df["Date"] on x-axis. All add_vline calls use _vline_x() helper.
-STACKED BAR: use stacked_bar_pi() everywhere instead of line charts for P&I breakdown.
-COLORS: principal=#1a3c5e, interest=#e74c3c, savings=#27ae60.
-TOOLTIPS: help= on all key inputs and metrics.
+Build Canadian Mortgage Analyzer Streamlit app (app.py). MANDATORY MS SQL Server via pyodbc.
+DEFAULTS: DB=localhost\\SQLEXPRESS/MortgageDB/Windows Auth. Mortgage: $1,030,000 | 20% down | 5.39% | 30yr amort | 3yr term | 2023-08-15 | Monthly | Fixed.
+MATH: periodic_rate uses two-step: eff=((1+r/200)**2); return eff**(1/n)-1. Build CalYear column in df.
+DB: mortgage_setup (single row), mortgage_scenarios(id,name,created_at,params,summary). DB-ONLY scenarios (no local duplicates).
+TAB ORDER: Setup | Rate Change Scenarios | Amortization Schedule | Prepayment | Break Penalty | Comparison.
+SETUP: Split into sections A(Purchase/Down) B(Mortgage Terms) C(Past Renewals collapsable) D(Past Prepayments collapsable).
+KEY METRICS: Initial Principal, Balance@TermEnd, Balance Today, Principal Paid, Interest Paid, Current Remaining Amortization (yrs + end date), Total Interest, Original Amortization Period, Current Monthly Payment. NO "Original Payoff" metric.
+STACKED BAR: stacked_bar_pi(df,today_p,term_end_p,title): x=CalYear strings, 3 colour segments (past=grey, current=blue/red, post=faded). Annotations at y=1.12/1.08 paper coords to avoid legend overlap. No add_vline on categorical axis.
+AMORTIZATION: Hierarchy toggle default: Past/Current(last4+today)/Future segments, each with Year sub-expanders. Full schedule ends at actual payoff period (len(df)).
+SCENARIO METRICS: base_remaining = today_m["remaining_years"] not amort_years.
+COMPARISON: first scenario defaults to "Current Mortgage (base)"; all saved DB scenarios selectable.
+WORD WIREFRAME: generate_wireframe_docx() using python-docx creating layout reference without any financial numbers. Download button on setup page.
+PENALTY: radio 3-Month/IRD/Custom + inline text_input for custom.
+ALL METRICS: help= tooltips. ALL CHARTS: CalYear string or date x-axis (never period numbers). FIX #11: annotations pushed to y>=1.08 paper coords.
 RUN: streamlit run app.py
