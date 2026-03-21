@@ -264,6 +264,12 @@ def render(tabs_list):
             else calc_pmt(insured_p, annual_rate, n_py, amort_years, accel)
         )
 
+        # Actual payoff = total periods in the schedule (may differ from amort_years
+        # if prepayments or rate changes shortened/lengthened it)
+        actual_payoff_years = round(len(full_df) / n_py, 1) if not full_df.empty else amort_years
+        period_today       = today_m.get("period_today", 0)
+        yrs_elapsed        = round(period_today / n_py, 1)
+
         mc1, mc2, mc3 = st.columns(3)
         mc1.markdown(f"""
 <div class="mc"><h3>Initial Mortgage Principal</h3><p>${insured_p:,.0f}</p></div>
@@ -278,8 +284,10 @@ def render(tabs_list):
 """, unsafe_allow_html=True)
 
         mc3.markdown(f"""
-<div class="mc"><h3>⏳ Current Remaining Amortization</h3>
-<p>{amort_years} yrs original &nbsp;·&nbsp; {rem_y:.1f} yrs more &nbsp;·&nbsp; ends {rem_end}</p></div>
+<div class="mc" title="Actual payoff = time elapsed + remaining. May differ from original amortization if prepayments or rate changes were applied.">
+  <h3>⏳ Current Remaining Amortization</h3>
+  <p>{actual_payoff_years:.1f} yrs payoff &nbsp;·&nbsp; {yrs_elapsed:.1f} elapsed &nbsp;·&nbsp; {rem_y:.1f} remaining &nbsp;·&nbsp; ends {rem_end}</p>
+</div>
 <div class="mc mc-r"><h3>Total Interest (full remaining amortization)</h3><p>${full_sum.get('total_interest', 0):,.0f}</p></div>
 <div class="mc"><h3>📆 Current Monthly Payment</h3><p>${curr_pmt:,.2f}</p></div>
 """, unsafe_allow_html=True)

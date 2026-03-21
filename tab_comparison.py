@@ -1,5 +1,10 @@
 """
-tabs/tab_comparison.py — Side-by-Side Scenario Comparison tab
+tab_comparison.py — Side-by-Side Scenario Comparison
+Changes vs previous:
+- Scenario columns pre-populated from saved DB values (rate, amort, label)
+- Removed Annual Lump and Frequency inputs (inherited from saved scenario params)
+- Users can edit Rate and Amort per column, then save changes back to DB
+- Comparison table drops Frequency / Annual Lump columns
 """
 import streamlit as st
 import pandas as pd
@@ -7,7 +12,7 @@ import plotly.graph_objects as go
 
 from mortgage_math import FREQ, calc_pmt, build_amortization
 from mortgage_charts import _vline_x
-from mortgage_db import db_load_scenarios
+from mortgage_db import db_load_scenarios, db_update_scenario
 
 PROMPT_TEXT = r"""Build Canadian Mortgage Analyzer Streamlit app (app.py) — modular structure.
 MANDATORY MS SQL Server via pyodbc.
@@ -25,38 +30,18 @@ TAB ORDER: Setup | Rate Change Scenarios | Amortization Schedule | Prepayment | 
 
 SETUP: Sections A(Purchase/Down) B(Mortgage Terms) C(Past Renewals collapsable) D(Past Prepayments collapsable).
 KEY METRICS: Initial Principal, Balance@TermEnd, Balance Today, Principal Paid, Interest Paid,
-Current Remaining Amortization (yrs + end date), Total Interest, Original Amortization Period,
-Current Monthly Payment. NO "Original Payoff" metric.
+Current Remaining Amortization shows: actual_payoff yrs (len(full_df)/n_py), elapsed yrs,
+remaining yrs, end date. NO "Original Payoff" metric.
 
-STACKED BAR: stacked_bar_pi(df,today_p,term_end_p,title): x=CalYear strings, 3 colour segments
-(past=grey, current=blue/red, post=faded).
-FIX #6: Legend at BOTTOM (y=-0.22), annotations at y=1.06/1.13 paper coords.
-No add_vline on categorical axis.
-
-AMORTIZATION: Hierarchy toggle default: Past/Current(last4+today)/Future segments.
-Full schedule ends at actual payoff period (len(df)).
-
-SCENARIO METRICS: base_remaining = today_m["remaining_years"] not amort_years.
-FIX #2: Show Base Interest / Current Remaining / Base Payment alongside Adjusted Interest /
-Adjusted Remaining / Mortgage-Free By in parallel two-column green box layout.
-
-COMPARISON: first scenario defaults to "Current Mortgage (base)"; all saved DB scenarios selectable.
-
-WORD WIREFRAME: generate_wireframe_docx() using python-docx. Download button on setup page.
-
-PENALTY: radio 3-Month/IRD/Custom + inline text_input for custom.
-
-ALL METRICS: help= tooltips.
-ALL CHARTS: CalYear string or date x-axis (never period numbers).
-
-FIX #1: Save scenario — use explicit if/else NOT ternary expression to avoid TypeError.
-FIX #3: Dark mode — add !important to .mc text colors so they contrast against light background.
-FIX #4: Modular code — mortgage_math.py, mortgage_db.py, mortgage_charts.py,
-mortgage_wireframe.py, tabs/tab_setup.py, tabs/tab_scenarios.py,
-tabs/tab_amortization.py, tabs/tab_prepayment.py, tabs/tab_breakpenalty.py,
-tabs/tab_comparison.py.
-
-MODULAR ENTRY: app.py imports and calls each tab module's render(tabs_list) function.
+COMPARISON TAB:
+- Loads saved DB scenarios by default (pre-populated rate/amort/label from DB params)
+- NO Frequency or Annual Lump inputs — those are inherited from each scenario's saved params
+- Editable per column: Label, Rate (%), Amort (yrs)
+- Show inherited Frequency as read-only caption
+- Add "Save Changes to DB" button per DB scenario column
+- Comparison table: Scenario | Rate | Amort | Orig Payment | Current Payment | Remaining | Total Interest | Total Paid
+- Balance chart + Annual P&I stacked bar + best-scenario callout
+- Download Prompt (.txt) button
 
 RUN: streamlit run app.py
 """
@@ -68,112 +53,163 @@ def require_setup():
         st.stop()
 
 
+def _scenario_rate(sc_par, fallback):
+    rcs = sc_par.get("rate_changes") or []
+    if rcs:
+        return float(rcs[-1].get("new_rate", fallback))
+    return float(sc_par.get("sc_rate", sc_par.get("annual_rate", fallback)))
+
+
 def render(tabs_list):
     with tabs_list[5]:
         st.subheader("🔄 Side-by-Side Scenario Comparison")
         require_setup()
         b = st.session_state["base"]
 
+        db_sc_cmp = db_load_scenarios(st.session_state.db_conn)
+        sc_option_names = ["Current Mortgage (base)"] + [s["name"] for s in db_sc_cmp]
+
         n_sc = st.radio(
             "Number of scenarios to compare", [2, 3, 4],
             horizontal=True, key="cmp_n"
         )
-        db_sc_cmp = db_load_scenarios(st.session_state.db_conn)
-        sc_option_names = ["Current Mortgage (base)"] + [s["name"] for s in db_sc_cmp]
+        st.caption(
+            "Each column loads saved scenario values by default. "
+            "Edit Rate or Amortization and click **💾 Save Changes** to persist updates."
+        )
 
         sc_defs = []
         cols = st.columns(int(n_sc))
+
         for i, col in enumerate(cols):
             with col:
                 st.markdown(f"**Scenario {i+1}**")
                 default_opt = 0 if i == 0 else min(i, len(sc_option_names) - 1)
                 sc_pick = st.selectbox(
-                    f"Scenario {i+1} source", sc_option_names,
+                    "Source", sc_option_names,
                     index=default_opt, key=f"cmp_src_{i}",
-                    help="Choose current mortgage or a saved scenario"
+                    help="Choose current mortgage or a saved DB scenario"
                 )
 
-                if sc_pick == "Current Mortgage (base)":
-                    rate = float(b["annual_rate"])
-                    amt = b["amort_years"]
-                    frq = b["payment_freq"]
-                    lbl = "Current Mortgage"
-                    rc_list = b.get("past_renewal_rcs") or []
+                is_base = (sc_pick == "Current Mortgage (base)")
+                sc_db_match = None
+
+                if is_base:
+                    def_rate  = float(b["annual_rate"])
+                    def_amort = int(b["amort_years"])
+                    def_freq  = b["payment_freq"]
+                    def_label = "Current Mortgage"
+                    def_rcs   = b.get("past_renewal_rcs") or []
+                    sc_db_id  = None
+                    sc_par    = {}
                 else:
-                    sc_match = next((s for s in db_sc_cmp if s["name"] == sc_pick), {})
-                    sc_par = sc_match.get("params", {})
-                    if sc_par.get("rate_changes"):
-                        rate = float(
-                            sc_par.get("rate_changes", [{}])[-1].get("new_rate", b["annual_rate"])
-                        )
-                    else:
-                        rate = float(sc_par.get("sc_rate", b["annual_rate"]))
-                    amt = sc_par.get("amort_years", b["amort_years"])
-                    frq = sc_par.get("payment_freq", b["payment_freq"])
-                    rc_list = (b.get("past_renewal_rcs") or []) + (sc_par.get("rate_changes") or [])
-                    lbl = sc_pick
+                    sc_db_match = next((s for s in db_sc_cmp if s["name"] == sc_pick), None)
+                    sc_par    = sc_db_match.get("params", {}) if sc_db_match else {}
+                    def_rate  = _scenario_rate(sc_par, b["annual_rate"])
+                    def_amort = int(sc_par.get("amort_years", b["amort_years"]))
+                    def_freq  = sc_par.get("payment_freq", b["payment_freq"])
+                    def_label = sc_pick
+                    def_rcs   = (b.get("past_renewal_rcs") or []) + (sc_par.get("rate_changes") or [])
+                    sc_db_id  = sc_db_match["id"] if sc_db_match else None
 
-                lbl = st.text_input("Label", lbl, key=f"cmp_lbl_{i}")
+                # ── Editable fields ────────────────────────────────────────
+                lbl = st.text_input(
+                    "Label", def_label, key=f"cmp_lbl_{i}",
+                    help="Display name for this scenario"
+                )
                 rate = st.number_input(
-                    "Rate (%)", 0.5, 20.0, float(rate), 0.01,
-                    key=f"cmp_rate_{i}", format="%.2f"
+                    "Rate (%)", 0.5, 20.0, float(def_rate), 0.01,
+                    key=f"cmp_rate_{i}", format="%.2f",
+                    help="Interest rate — edit to model a different rate"
                 )
-                amt = st.slider("Amort (yrs)", 5, 30, int(amt), key=f"cmp_amt_{i}")
-                frq = st.selectbox(
-                    "Frequency", list(FREQ.keys()),
-                    index=list(FREQ.keys()).index(b["payment_freq"]),
-                    key=f"cmp_frq_{i}"
+                amt = st.slider(
+                    "Amort (yrs)", 5, 30, int(def_amort),
+                    key=f"cmp_amt_{i}",
+                    help="Amortization period — edit to model a different term"
                 )
-                lump = st.number_input(
-                    "Annual lump ($)", 0, 200_000, 0, 1_000, key=f"cmp_lump_{i}"
+                # Frequency is read-only — comes from the saved scenario
+                st.caption(
+                    f"📅 Frequency: **{def_freq}** (from saved scenario)",
+                    help="Payment frequency is inherited from the saved scenario and not overridable here"
                 )
 
-                fc_ = FREQ[frq]
-                ny = fc_["n"]
-                ac = fc_["accel"]
-                ex = list(b.get("past_extra", []))
-                if lump > 0:
-                    for yr in range(1, amt + 1):
-                        ex.append({"period": max(1, int((yr - 1) * ny + ny // 2)), "amount": float(lump)})
+                # ── Save Changes button — only for DB scenarios ────────────
+                if not is_base and sc_db_id is not None:
+                    sv1, sv2 = st.columns([1, 2])
+                    if sv1.button("💾 Save Changes", key=f"cmp_save_{i}",
+                                  help="Persist rate/amort edits back to this DB scenario"):
+                        updated_params = dict(sc_par)
+                        updated_params["amort_years"] = amt
+                        # Push updated rate into the last rate_change entry, or sc_rate
+                        if updated_params.get("rate_changes"):
+                            updated_params["rate_changes"][-1]["new_rate"] = rate
+                        else:
+                            updated_params["sc_rate"] = rate
+                        # Rebuild summary so stored data stays consistent
+                        fc_u = FREQ.get(def_freq, FREQ["Monthly"])
+                        _, upd_sum = build_amortization(
+                            b["principal"], rate, fc_u["n"], amt,
+                            accel=fc_u["accel"], start_date=b["start_date"],
+                            extra_payments=b.get("past_extra") or None,
+                            rate_changes=def_rcs or None,
+                        )
+                        ok = db_update_scenario(
+                            st.session_state.db_conn,
+                            sc_db_id, lbl, updated_params, upd_sum
+                        )
+                        if ok:
+                            sv2.success("✅ Saved")
+                        else:
+                            sv2.error("❌ Save failed")
 
-                df_c, s_c = build_amortization(
+                # ── Build amortization ─────────────────────────────────────
+                fc_ = FREQ.get(def_freq, FREQ["Monthly"])
+                ny  = fc_["n"]
+                ac  = fc_["accel"]
+
+                df_c, s_c  = build_amortization(
                     b["principal"], rate, ny, amt,
                     accel=ac, start_date=b["start_date"],
-                    extra_payments=ex or None,
-                    rate_changes=rc_list or None,
+                    extra_payments=b.get("past_extra") or None,
+                    rate_changes=def_rcs or None,
                 )
-                pmt_c = calc_pmt(b["principal"], rate, ny, amt, ac)
-                tp_c = b["today_m"].get("period_today", 0)
-                rem_c = round((len(df_c) - tp_c) / ny, 1) if tp_c > 0 and not df_c.empty else amt
-                today_bal_c = b["today_m"].get("balance_today", b["principal"])
-                pmt_today_c = (
-                    calc_pmt(today_bal_c, rate, ny, rem_c, ac) if rem_c > 0 else pmt_c
-                )
+                pmt_c      = calc_pmt(b["principal"], rate, ny, amt, ac)
+                tp_c       = b["today_m"].get("period_today", 0)
+                rem_c      = round((len(df_c) - tp_c) / ny, 1) if tp_c > 0 and not df_c.empty else amt
+                today_bal  = b["today_m"].get("balance_today", b["principal"])
+                pmt_today  = calc_pmt(today_bal, rate, ny, rem_c, ac) if rem_c > 0 else pmt_c
+
                 sc_defs.append({
-                    "label": lbl, "rate": rate, "amort": amt, "freq": frq,
-                    "lump": lump, "df": df_c, "summary": s_c,
-                    "payment": pmt_c, "pmt_today": pmt_today_c,
-                    "rem": rem_c, "n_py": ny,
+                    "label":     lbl,
+                    "rate":      rate,
+                    "amort":     amt,
+                    "freq":      def_freq,
+                    "df":        df_c,
+                    "summary":   s_c,
+                    "payment":   pmt_c,
+                    "pmt_today": pmt_today,
+                    "rem":       rem_c,
+                    "n_py":      ny,
                 })
 
+        # ── Comparison table ───────────────────────────────────────────────
         st.divider()
         comp_rows = []
         for sc in sc_defs:
             s = sc["summary"]
             comp_rows.append({
-                "Scenario": sc["label"],
-                "Rate": f"{sc['rate']:.2f}%",
-                "Amort": f"{sc['amort']} yrs",
-                "Frequency": sc["freq"],
-                "Annual Lump": f"${sc['lump']:,.0f}",
-                "Orig Payment": f"${sc['payment']:,.2f}",
+                "Scenario":        sc["label"],
+                "Rate":            f"{sc['rate']:.2f}%",
+                "Amort":           f"{sc['amort']} yrs",
+                "Orig Payment":    f"${sc['payment']:,.2f}",
                 "Current Payment": f"${sc['pmt_today']:,.2f}",
-                "Remaining": f"{sc['rem']:.1f} yrs",
-                "Total Interest": f"${s.get('total_interest', 0):,.0f}",
-                "Total Paid": f"${s.get('total_paid', 0):,.0f}",
+                "Remaining":       f"{sc['rem']:.1f} yrs",
+                "Total Interest":  f"${s.get('total_interest', 0):,.0f}",
+                "Total Paid":      f"${s.get('total_paid', 0):,.0f}",
             })
         st.dataframe(pd.DataFrame(comp_rows), use_container_width=True)
 
+        # ── Balance comparison chart ───────────────────────────────────────
         pal = ["#1a3c5e", "#e74c3c", "#27ae60", "#f39c12"]
         fig_c = go.Figure()
         for i, sc in enumerate(sc_defs):
@@ -182,7 +218,6 @@ def render(tabs_list):
                     x=sc["df"]["Date"], y=sc["df"]["Balance"],
                     name=sc["label"], line=dict(color=pal[i])
                 )
-
         full_df_ref = b.get("full_df")
         if full_df_ref is not None and b["today_m"].get("period_today"):
             tp = b["today_m"]["period_today"]
@@ -192,7 +227,6 @@ def render(tabs_list):
                     x=_vline_x(td_d2), line_dash="dash", line_color="#27ae60",
                     annotation_text="Today", annotation_position="top right"
                 )
-
         fig_c.update_layout(
             title="Balance Comparison",
             xaxis_title="Date", yaxis_title="($)",
@@ -200,6 +234,7 @@ def render(tabs_list):
         )
         st.plotly_chart(fig_c, use_container_width=True, key="ch_cmpbal")
 
+        # ── Annual P&I stacked bar ─────────────────────────────────────────
         fig_cmp_bar = go.Figure()
         for i, sc in enumerate(sc_defs):
             if sc["df"].empty:
@@ -228,16 +263,20 @@ def render(tabs_list):
         )
         st.plotly_chart(fig_cmp_bar, use_container_width=True, key="ch_cmpbar")
 
-        best = min(range(len(sc_defs)),
-                   key=lambda i: sc_defs[i]["summary"].get("total_interest", 1e12))
-        worst_i = max(sc["summary"].get("total_interest", 0) for sc in sc_defs)
+        # ── Best scenario callout ──────────────────────────────────────────
+        best = min(
+            range(len(sc_defs)),
+            key=lambda i: sc_defs[i]["summary"].get("total_interest", 1e12)
+        )
+        worst_int = max(sc["summary"].get("total_interest", 0) for sc in sc_defs)
         st.markdown(
             f'<div class="ok">🏆 <b>{sc_defs[best]["label"]}</b> saves '
-            f'${worst_i - sc_defs[best]["summary"].get("total_interest", 0):,.0f} · '
-            f'Remaining: <b>{sc_defs[best]["rem"]:.1f} yrs</b></div>',
+            f'${worst_int - sc_defs[best]["summary"].get("total_interest", 0):,.0f} in interest '
+            f'· Remaining: <b>{sc_defs[best]["rem"]:.1f} yrs</b></div>',
             unsafe_allow_html=True
         )
 
+        # ── Prompt download ────────────────────────────────────────────────
         st.divider()
         st.download_button(
             "📥 Download Fresh-Chat Prompt (.txt)",
