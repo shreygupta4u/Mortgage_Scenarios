@@ -1,0 +1,53 @@
+Build Canadian Mortgage Analyzer Streamlit app. MANDATORY MS SQL Server via pyodbc.
+DEFAULTS: DB=localhost\\SQLEXPRESS/MortgageDB/Windows Auth.
+Mortgage: $1,030,000 | 20% down | 5.39% | 30yr | 3yr term | 2023-08-15 | Monthly | Fixed.
+
+DIRECTORY STRUCTURE (critical — flat files cause ModuleNotFoundError):
+  app.py                          ← entry point
+  setup_db.sql                    ← 3NF schema, run once
+  requirements.txt
+  modules/
+      __init__.py                 ← re-exports all symbols (from modules import X works)
+      mortgage_math.py            ← FREQ, periodic_rate, calc_pmt, build_amortization, etc.
+      mortgage_db.py              ← DB helpers + db_update_scenario; reads setup_db.sql on init
+      mortgage_charts.py          ← stacked_bar_pi (x=CalYear, legend bottom, annotations top)
+      mortgage_wireframe.py       ← generate_wireframe_docx via python-docx (no PII)
+  pages/
+      __init__.py                 ← re-exports render_tab_* functions
+      tab_setup.py                → render_tab_setup(conn)
+      tab_scenarios.py            → render_tab_scenarios(conn, b)
+      tab_prepayment.py           → render_tab_prepayment(conn, b)
+      tab_schedule.py             → render_tab_schedule(conn, b)
+      tab_comparison.py           → render_tab_comparison(conn, b)
+
+IMPORT RULES:
+- app.py:          from modules import get_db_connection, db_load_setup
+                   from pages import render_tab_setup, render_tab_scenarios, ...
+- pages/tab_*.py:  from modules.mortgage_math import ...   (or from modules import ...)
+                   from modules.mortgage_db import ...
+                   from modules.mortgage_charts import ...
+- modules/__init__.py must re-export every symbol any tab uses via `from modules import`
+- NEVER use flat imports like `from mortgage_math import` inside pages/ — will fail
+
+TAB ORDER: Setup | Rate Change Scenarios | Prepayment Analysis | Amortization Schedule | Comparison
+(5 tabs, no Break Penalty tab in routing — file exists but is standalone)
+
+KEY FIXES:
+- FIX #1: db save uses if/else not ternary (avoids TypeError on bool return)
+- FIX #2: Metrics Row1=Base Interest/Remaining/Required Payment; Row2=Adjusted (green boxes)
+- FIX #3: CSS: explicit dark text colors on light-bg notification divs (.warn/.ok/.inf/.pen)
+- FIX #5: DB init reads setup_db.sql from app folder before inline DDL fallback
+- FIX #6: Chart legend at bottom; Today/Term-End annotations at top with bgcolor boxes
+- FIX #7: calc_monthly_sc = calc_pmt(today_bal, last_rate, n_py, base_remaining_yrs)
+          so Scenario Remaining == Current Remaining when payment = required payment
+- FIX #8: All page render functions use signature (conn, b); b passed from app.py session_state
+- FIX #9: tab_comparison uses 3NF schema (renewals list, db_id) not old JSON params blob
+          db_update_scenario(conn, db_id, name, desc, renewals, pp_settings) added to mortgage_db
+
+MATH: Canadian semi-annual compounding: eff = (1+r/200)^2; periodic = eff^(1/n)-1
+DB SCHEMA: mortgage_setup (1 row), mortgage_past_renewals, mortgage_past_prepayments,
+           mortgage_scenarios, mortgage_scenario_renewals (all normalized 3NF)
+
+app.py sys.path.insert(0, root) ensures all submodule imports resolve correctly.
+
+RUN: streamlit run app.py
