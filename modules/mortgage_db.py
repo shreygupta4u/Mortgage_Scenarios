@@ -1,5 +1,6 @@
-"""mortgage_db.py — 3NF database helpers. Reads setup_db.sql on init."""
-import os, json
+"""mortgage_db.py — 3NF database helpers. Reads setup_db.sql ONLY on first install."""
+import os
+import uuid as _uuid_mod
 from datetime import date
 
 
@@ -21,7 +22,6 @@ def _run_sql_file(conn, path):
     with open(path) as f:
         sql = f.read()
     c = conn.cursor()
-    # Execute each GO-separated batch
     for batch in sql.split("\nGO"):
         batch = batch.strip()
         if batch and not batch.startswith("--"):
@@ -32,8 +32,92 @@ def _run_sql_file(conn, path):
     conn.commit()
 
 
+def _tables_exist(conn):
+    try:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM information_schema.tables "
+                  "WHERE table_name='mortgage_setup'")
+        return (c.fetchone()[0] or 0) > 0
+    except Exception:
+        return False
+
+
+def _create_tables_inline(conn):
+    """Fallback DDL when setup_db.sql is not found."""
+    c = conn.cursor()
+    stmts = [
+        "IF NOT EXISTS(SELECT * FROM sysobjects WHERE name='mortgage_setup' AND xtype='U') "
+        "CREATE TABLE mortgage_setup(id INT IDENTITY PRIMARY KEY, purchase_price DECIMAL(15,2) NOT NULL, "
+        "down_pct DECIMAL(5,2) NOT NULL DEFAULT 20, mortgage_type NVARCHAR(20) NOT NULL DEFAULT 'Fixed', "
+        "pay_frequency NVARCHAR(30) NOT NULL DEFAULT 'Monthly', annual_rate DECIMAL(7,4) NOT NULL, "
+        "amort_years INT NOT NULL DEFAULT 30, term_years DECIMAL(4,1) NOT NULL DEFAULT 3, "
+        "start_date DATE NOT NULL, include_cmhc BIT NOT NULL DEFAULT 1, saved_at DATETIME DEFAULT GETDATE())",
+
+        "IF NOT EXISTS(SELECT * FROM sysobjects WHERE name='mortgage_past_renewals' AND xtype='U') "
+        "CREATE TABLE mortgage_past_renewals(id INT IDENTITY PRIMARY KEY, setup_id INT, seq_num INT, "
+        "start_date DATE, annual_rate DECIMAL(7,4), mortgage_type NVARCHAR(20), term_years DECIMAL(4,1))",
+
+        "IF NOT EXISTS(SELECT * FROM sysobjects WHERE name='mortgage_past_prepayments' AND xtype='U') "
+        "CREATE TABLE mortgage_past_prepayments(id INT IDENTITY PRIMARY KEY, setup_id INT, seq_num INT, "
+        "payment_date DATE, amount DECIMAL(15,2))",
+
+        "IF NOT EXISTS(SELECT * FROM sysobjects WHERE name='mortgage_scenarios' AND xtype='U') "
+        "CREATE TABLE mortgage_scenarios(id INT IDENTITY PRIMARY KEY, name NVARCHAR(200), "
+        "description NVARCHAR(2000) DEFAULT '', annual_lump DECIMAL(15,2) DEFAULT 0, "
+        "lump_month INT DEFAULT 1, lump_start_year INT DEFAULT 1, lump_num_years INT DEFAULT 0, "
+        "pay_increase_type NVARCHAR(20) DEFAULT 'None', pay_increase_val DECIMAL(10,2) DEFAULT 0, "
+        "onetime_period INT DEFAULT 0, onetime_amount DECIMAL(15,2) DEFAULT 0, "
+        "created_at DATETIME DEFAULT GETDATE(), updated_at DATETIME DEFAULT GETDATE())",
+
+        "IF NOT EXISTS(SELECT * FROM sysobjects WHERE name='mortgage_scenario_renewals' AND xtype='U') "
+        "CREATE TABLE mortgage_scenario_renewals(id INT IDENTITY PRIMARY KEY, scenario_id INT, "
+        "seq_num INT, mode NVARCHAR(20) DEFAULT 'By Date', effective_date DATE, effective_period INT DEFAULT 1, "
+        "new_rate DECIMAL(7,4), mortgage_type NVARCHAR(20) DEFAULT 'Fixed', term_years DECIMAL(4,1) DEFAULT 3, "
+        "actual_penalty DECIMAL(15,2) DEFAULT 0, misc_fees DECIMAL(15,2) DEFAULT 250, "
+        "orig_posted_rate DECIMAL(7,4) DEFAULT 0, curr_posted_rate DECIMAL(7,4) DEFAULT 0, "
+        "onetime_amount DECIMAL(15,2) DEFAULT 0)",
+    ]
+    for sql in stmts:
+        try:
+            c.execute(sql)
+        except Exception:
+            pass
+    conn.commit()
+
+
+def _run_migrations(conn):
+    """
+    Idempotent schema migrations — safe to run on every connect.
+    """
+    c = conn.cursor()
+    migrations = [
+        # v2→v3: per-renewal one-time lump-sum column
+        "IF NOT EXISTS (SELECT * FROM sys.columns "
+        "WHERE object_id=OBJECT_ID('mortgage_scenario_renewals') AND name='onetime_amount') "
+        "ALTER TABLE mortgage_scenario_renewals ADD onetime_amount DECIMAL(15,2) DEFAULT 0",
+    ]
+    for sql in migrations:
+        try:
+            c.execute(sql)
+        except Exception:
+            pass
+    conn.commit()
+
+
 def _init_db(conn):
-    """Create 3NF tables. Reads setup_db.sql if present."""
+    """
+    ROOT-CAUSE FIX: Previously called setup_db.sql on EVERY connect,
+    which runs DROP TABLE statements, wiping all saved data every restart.
+
+    New behaviour:
+    - Tables already exist  →  run migrations only (never drop)
+    - First install          →  find setup_db.sql or fall back to inline DDL
+    """
+    if _tables_exist(conn):
+        _run_migrations(conn)
+        return
+
+    # First install — locate setup_db.sql
     this_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.path.join(os.path.dirname(this_dir), "setup_db.sql"),
@@ -43,54 +127,24 @@ def _init_db(conn):
     for p in candidates:
         if os.path.exists(p):
             _run_sql_file(conn, p)
+            _run_migrations(conn)   # add any new columns setup_db.sql doesn't have
             return
-    # Inline fallback (minimal)
-    c = conn.cursor()
-    for sql in [
-        "IF NOT EXISTS(SELECT * FROM sysobjects WHERE name='mortgage_setup' AND xtype='U') "
-        "CREATE TABLE mortgage_setup(id INT IDENTITY PRIMARY KEY, purchase_price DECIMAL(15,2) NOT NULL, "
-        "down_pct DECIMAL(5,2) NOT NULL DEFAULT 20, mortgage_type NVARCHAR(20) NOT NULL DEFAULT 'Fixed', "
-        "pay_frequency NVARCHAR(30) NOT NULL DEFAULT 'Monthly', annual_rate DECIMAL(7,4) NOT NULL, "
-        "amort_years INT NOT NULL DEFAULT 30, term_years DECIMAL(4,1) NOT NULL DEFAULT 3, "
-        "start_date DATE NOT NULL, include_cmhc BIT NOT NULL DEFAULT 1, saved_at DATETIME DEFAULT GETDATE())",
-        "IF NOT EXISTS(SELECT * FROM sysobjects WHERE name='mortgage_past_renewals' AND xtype='U') "
-        "CREATE TABLE mortgage_past_renewals(id INT IDENTITY PRIMARY KEY, setup_id INT, seq_num INT, "
-        "start_date DATE, annual_rate DECIMAL(7,4), mortgage_type NVARCHAR(20), term_years DECIMAL(4,1))",
-        "IF NOT EXISTS(SELECT * FROM sysobjects WHERE name='mortgage_past_prepayments' AND xtype='U') "
-        "CREATE TABLE mortgage_past_prepayments(id INT IDENTITY PRIMARY KEY, setup_id INT, seq_num INT, "
-        "payment_date DATE, amount DECIMAL(15,2))",
-        "IF NOT EXISTS(SELECT * FROM sysobjects WHERE name='mortgage_scenarios' AND xtype='U') "
-        "CREATE TABLE mortgage_scenarios(id INT IDENTITY PRIMARY KEY, name NVARCHAR(200), "
-        "description NVARCHAR(2000) DEFAULT '', annual_lump DECIMAL(15,2) DEFAULT 0, "
-        "lump_month INT DEFAULT 1, lump_start_year INT DEFAULT 1, lump_num_years INT DEFAULT 0, "
-        "pay_increase_type NVARCHAR(20) DEFAULT 'None', pay_increase_val DECIMAL(10,2) DEFAULT 0, "
-        "onetime_period INT DEFAULT 0, onetime_amount DECIMAL(15,2) DEFAULT 0, "
-        "created_at DATETIME DEFAULT GETDATE(), updated_at DATETIME DEFAULT GETDATE())",
-        "IF NOT EXISTS(SELECT * FROM sysobjects WHERE name='mortgage_scenario_renewals' AND xtype='U') "
-        "CREATE TABLE mortgage_scenario_renewals(id INT IDENTITY PRIMARY KEY, scenario_id INT, "
-        "seq_num INT, mode NVARCHAR(20) DEFAULT 'By Date', effective_date DATE, effective_period INT DEFAULT 1, "
-        "new_rate DECIMAL(7,4), mortgage_type NVARCHAR(20) DEFAULT 'Fixed', term_years DECIMAL(4,1) DEFAULT 3, "
-        "actual_penalty DECIMAL(15,2) DEFAULT 0, misc_fees DECIMAL(15,2) DEFAULT 250, "
-        "orig_posted_rate DECIMAL(7,4) DEFAULT 0, curr_posted_rate DECIMAL(7,4) DEFAULT 0)",
-    ]:
-        try:
-            c.execute(sql)
-        except Exception:
-            pass
-    conn.commit()
+
+    _create_tables_inline(conn)
 
 
 # ── Setup load/save ───────────────────────────────────────────────
 def db_load_setup(conn):
-    """Return setup dict with nested past_renewals and past_prepayments."""
-    if not conn: return None
+    if not conn:
+        return None
     try:
         c = conn.cursor()
         c.execute("SELECT TOP 1 id, purchase_price, down_pct, mortgage_type, pay_frequency, "
                   "annual_rate, amort_years, term_years, start_date, include_cmhc "
                   "FROM mortgage_setup ORDER BY id DESC")
         row = c.fetchone()
-        if not row: return None
+        if not row:
+            return None
         sid, pp, dpct, mt, pf, ar, ay, ty, sd, ic = row
 
         c.execute("SELECT seq_num, start_date, annual_rate, mortgage_type, term_years "
@@ -115,12 +169,11 @@ def db_load_setup(conn):
 
 
 def db_save_setup(conn, data):
-    """Upsert: delete all rows, insert fresh normalized rows."""
-    if not conn: return False
+    if not conn:
+        return False
     try:
         c = conn.cursor()
         ws = data.get("widget_state", {})
-        # Delete old data (cascade deletes renewals + prepayments)
         c.execute("DELETE FROM mortgage_past_prepayments WHERE setup_id IN (SELECT id FROM mortgage_setup)")
         c.execute("DELETE FROM mortgage_past_renewals WHERE setup_id IN (SELECT id FROM mortgage_setup)")
         c.execute("DELETE FROM mortgage_setup")
@@ -162,12 +215,12 @@ def db_save_setup(conn, data):
 # ── Scenario load/save ────────────────────────────────────────────
 def db_save_scenario(conn, sc_id_or_none, name, desc, renewals, pp_settings):
     """Insert or update a scenario with its renewals. Returns DB id."""
-    if not conn: return None
+    if not conn:
+        return None
     try:
         c = conn.cursor()
-        pp = pp_settings  # dict with annual_lump, lump_month, etc.
+        pp = pp_settings
         if sc_id_or_none:
-            # Update
             c.execute("UPDATE mortgage_scenarios SET name=?, description=?, "
                       "annual_lump=?, lump_month=?, lump_start_year=?, lump_num_years=?, "
                       "pay_increase_type=?, pay_increase_val=?, "
@@ -182,7 +235,6 @@ def db_save_scenario(conn, sc_id_or_none, name, desc, renewals, pp_settings):
             db_id = sc_id_or_none
             c.execute("DELETE FROM mortgage_scenario_renewals WHERE scenario_id=?", db_id)
         else:
-            # Insert
             c.execute("INSERT INTO mortgage_scenarios "
                       "(name, description, annual_lump, lump_month, lump_start_year, lump_num_years, "
                       "pay_increase_type, pay_increase_val, onetime_period, onetime_amount) "
@@ -200,12 +252,14 @@ def db_save_scenario(conn, sc_id_or_none, name, desc, renewals, pp_settings):
             c.execute("INSERT INTO mortgage_scenario_renewals "
                       "(scenario_id, seq_num, mode, effective_date, effective_period, "
                       "new_rate, mortgage_type, term_years, actual_penalty, misc_fees, "
-                      "orig_posted_rate, curr_posted_rate) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                      "orig_posted_rate, curr_posted_rate, onetime_amount) "
+                      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                       db_id, i, rn.get("mode", "By Date"),
                       str(eff_date) if eff_date else None, int(rn.get("period", 1)),
                       float(rn["new_rate"]), rn.get("mtype", "Fixed"), float(rn.get("term_years", 3)),
                       float(rn.get("actual_penalty", 0)), float(rn.get("misc_fees", 250)),
-                      float(rn.get("orig_posted", 0)), float(rn.get("curr_posted", 0)))
+                      float(rn.get("orig_posted", 0)), float(rn.get("curr_posted", 0)),
+                      float(rn.get("onetime_amount", 0)))
         conn.commit()
         return db_id
     except Exception as e:
@@ -215,7 +269,8 @@ def db_save_scenario(conn, sc_id_or_none, name, desc, renewals, pp_settings):
 
 def db_load_scenarios(conn):
     """Return list of scenario dicts with nested renewals."""
-    if not conn: return []
+    if not conn:
+        return []
     try:
         c = conn.cursor()
         c.execute("SELECT id, name, description, annual_lump, lump_month, lump_start_year, "
@@ -229,14 +284,14 @@ def db_load_scenarios(conn):
             c2 = conn.cursor()
             c2.execute("SELECT seq_num, mode, effective_date, effective_period, new_rate, "
                        "mortgage_type, term_years, actual_penalty, misc_fees, "
-                       "orig_posted_rate, curr_posted_rate "
+                       "orig_posted_rate, curr_posted_rate, "
+                       "ISNULL(onetime_amount, 0) "
                        "FROM mortgage_scenario_renewals WHERE scenario_id=? ORDER BY seq_num", sid)
             renewals = []
-            import uuid as _uuid
             for r in c2.fetchall():
-                (sn, mode, edate, eper, nr, mt, ty, ap, mf, op, cp) = r
+                (sn, mode, edate, eper, nr, mt, ty, ap, mf, op, cp, ren_ota) = r
                 renewals.append({
-                    "id": str(_uuid.uuid4())[:8],
+                    "id": str(_uuid_mod.uuid4())[:8],
                     "mode": mode or "By Date",
                     "date_str": str(edate) if edate else None,
                     "period": int(eper) if eper else 1,
@@ -247,6 +302,7 @@ def db_load_scenarios(conn):
                     "misc_fees": float(mf) if mf else 250,
                     "orig_posted": float(op) if op else 0,
                     "curr_posted": float(cp) if cp else 0,
+                    "onetime_amount": float(ren_ota) if ren_ota else 0,
                     "variable_subs": {},
                 })
             pp_settings = {
@@ -271,7 +327,8 @@ def db_load_scenarios(conn):
 
 
 def db_delete_scenario(conn, db_id):
-    if not conn: return
+    if not conn:
+        return
     try:
         c = conn.cursor()
         c.execute("DELETE FROM mortgage_scenario_renewals WHERE scenario_id=?", db_id)
@@ -282,10 +339,7 @@ def db_delete_scenario(conn, db_id):
 
 
 def db_update_scenario(conn, db_id, name, desc, renewals, pp_settings):
-    """Update an existing scenario in-place (name, renewals, prepayment settings).
-    Thin wrapper around db_save_scenario that always treats db_id as an update.
-    Returns True on success, False on failure.
-    """
+    """Update an existing scenario in-place. Returns True on success."""
     if not conn or not db_id:
         return False
     result = db_save_scenario(conn, db_id, name, desc or "", renewals, pp_settings)
