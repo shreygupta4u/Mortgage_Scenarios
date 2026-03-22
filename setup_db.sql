@@ -57,6 +57,8 @@ CREATE TABLE mortgage_scenarios (
     pay_increase_val     DECIMAL(10,2)  DEFAULT 0,
     onetime_period       INT            DEFAULT 0,
     onetime_amount       DECIMAL(15,2)  DEFAULT 0,
+    onetime_amount       DECIMAL(15,2)  DEFAULT 0,
+    user_pmt             DECIMAL(10,2)  DEFAULT 0,    -- user-specified monthly payment
     created_at           DATETIME       DEFAULT GETDATE(),
     updated_at           DATETIME       DEFAULT GETDATE()
 );
@@ -76,5 +78,22 @@ CREATE TABLE mortgage_scenario_renewals (
     misc_fees        DECIMAL(15,2) DEFAULT 250,
     orig_posted_rate DECIMAL(7,4)  DEFAULT 0,
     curr_posted_rate DECIMAL(7,4)  DEFAULT 0,
-    onetime_amount   DECIMAL(15,2) DEFAULT 0    -- per-renewal lump-sum prepayment
+    onetime_amount   DECIMAL(15,2) DEFAULT 0    -- per-renewal lump-sum
+);
+
+-- ── Prepayment scenarios (standalone strategies) ─────────────────
+CREATE TABLE mortgage_prepay_scenarios (
+    id                   INT IDENTITY PRIMARY KEY,
+    name                 NVARCHAR(200)  NOT NULL,
+    description          NVARCHAR(2000) DEFAULT '',
+    annual_lump          DECIMAL(15,2)  DEFAULT 0,
+    lump_month           INT            DEFAULT 1,
+    lump_start_year      INT            DEFAULT 1,
+    lump_num_years       INT            DEFAULT 0,
+    pay_increase_type    NVARCHAR(20)   DEFAULT 'None',
+    pay_increase_val     DECIMAL(10,2)  DEFAULT 0,
+    onetime_period       INT            DEFAULT 0,
+    onetime_amount       DECIMAL(15,2)  DEFAULT 0,
+    created_at           DATETIME       DEFAULT GETDATE(),
+    updated_at           DATETIME       DEFAULT GETDATE()
 );
