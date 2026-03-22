@@ -1,1 +1,1 @@
-streamlit run app.py
+streamlit run app.py --server.headless true & start chrome http://localhost:8501

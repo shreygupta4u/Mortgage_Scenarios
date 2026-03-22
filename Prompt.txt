@@ -1,188 +1,53 @@
-Build Canadian Mortgage Analyzer Streamlit app — modular structure (app.py + supporting modules).
-MANDATORY MS SQL Server via pyodbc.
+Build Canadian Mortgage Analyzer Streamlit app. MANDATORY MS SQL Server via pyodbc.
+DEFAULTS: DB=localhost\\SQLEXPRESS/MortgageDB/Windows Auth.
+Mortgage: $1,030,000 | 20% down | 5.39% | 30yr | 3yr term | 2023-08-15 | Monthly | Fixed.
 
-============================================================
-DEFAULTS
-============================================================
-DB = localhost\SQLEXPRESS / database = MortgageDB / Windows Authentication.
-Mortgage: $1,030,000 | 20% down | 5.39% annual rate | 30-yr amortization |
-3-yr term | Start 2023-08-15 | Monthly payments | Fixed rate mortgage.
+DIRECTORY STRUCTURE (critical — flat files cause ModuleNotFoundError):
+  app.py                          ← entry point
+  setup_db.sql                    ← 3NF schema, run once
+  requirements.txt
+  modules/
+      __init__.py                 ← re-exports all symbols (from modules import X works)
+      mortgage_math.py            ← FREQ, periodic_rate, calc_pmt, build_amortization, etc.
+      mortgage_db.py              ← DB helpers + db_update_scenario; reads setup_db.sql on init
+      mortgage_charts.py          ← stacked_bar_pi (x=CalYear, legend bottom, annotations top)
+      mortgage_wireframe.py       ← generate_wireframe_docx via python-docx (no PII)
+  pages/
+      __init__.py                 ← re-exports render_tab_* functions
+      tab_setup.py                → render_tab_setup(conn)
+      tab_scenarios.py            → render_tab_scenarios(conn, b)
+      tab_prepayment.py           → render_tab_prepayment(conn, b)
+      tab_schedule.py             → render_tab_schedule(conn, b)
+      tab_comparison.py           → render_tab_comparison(conn, b)
 
-============================================================
-FILE STRUCTURE (modular — one concern per file)
-============================================================
-app.py                      — Entry point: page config, CSS, DB gate, tab render calls
-mortgage_math.py            — FREQ dict, periodic_rate, calc_pmt, cmhc_premium,
-                              date_to_period, period_to_date, calc_remaining_years,
-                              build_amortization, get_today_metrics, calc_break_penalty
-mortgage_db.py              — get_db_connection, _init_db, _run_sql_file,
-                              db_load/save_setup, db_save/update/load/delete_scenario
-mortgage_charts.py          — stacked_bar_pi, _vline_x helpers
-mortgage_wireframe.py       — generate_wireframe_docx (python-docx, no financial data)
-setup_db.sql                — SQL DDL for mortgage_setup and mortgage_scenarios tables
-tabs/__init__.py            — empty
-tabs/tab_setup.py           — Tab 1: Setup & Overview
-tabs/tab_scenarios.py       — Tab 2: Rate Change Scenarios
-tabs/tab_amortization.py    — Tab 3: Amortization Schedule
-tabs/tab_prepayment.py      — Tab 4: Prepayment Analysis
-tabs/tab_breakpenalty.py    — Tab 5: Break Penalty Calculator
-tabs/tab_comparison.py      — Tab 6: Scenario Comparison + Prompt download
+IMPORT RULES:
+- app.py:          from modules import get_db_connection, db_load_setup
+                   from pages import render_tab_setup, render_tab_scenarios, ...
+- pages/tab_*.py:  from modules.mortgage_math import ...   (or from modules import ...)
+                   from modules.mortgage_db import ...
+                   from modules.mortgage_charts import ...
+- modules/__init__.py must re-export every symbol any tab uses via `from modules import`
+- NEVER use flat imports like `from mortgage_math import` inside pages/ — will fail
 
-============================================================
-MATH
-============================================================
-periodic_rate(annual_pct, n):
-    Two-step Canadian semi-annual compounding:
-    eff = (1 + r/200)**2
-    return eff**(1/n) - 1
+TAB ORDER: Setup | Rate Change Scenarios | Prepayment Analysis | Amortization Schedule | Comparison
+(5 tabs, no Break Penalty tab in routing — file exists but is standalone)
 
-calc_pmt: standard annuity formula; accelerated variants divide monthly pmt by (n/12).
-Build CalYear column in amortization df using _year_of(date).
+KEY FIXES:
+- FIX #1: db save uses if/else not ternary (avoids TypeError on bool return)
+- FIX #2: Metrics Row1=Base Interest/Remaining/Required Payment; Row2=Adjusted (green boxes)
+- FIX #3: CSS: explicit dark text colors on light-bg notification divs (.warn/.ok/.inf/.pen)
+- FIX #5: DB init reads setup_db.sql from app folder before inline DDL fallback
+- FIX #6: Chart legend at bottom; Today/Term-End annotations at top with bgcolor boxes
+- FIX #7: calc_monthly_sc = calc_pmt(today_bal, last_rate, n_py, base_remaining_yrs)
+          so Scenario Remaining == Current Remaining when payment = required payment
+- FIX #8: All page render functions use signature (conn, b); b passed from app.py session_state
+- FIX #9: tab_comparison uses 3NF schema (renewals list, db_id) not old JSON params blob
+          db_update_scenario(conn, db_id, name, desc, renewals, pp_settings) added to mortgage_db
 
-============================================================
-DATABASE
-============================================================
-Tables: mortgage_setup (single row), mortgage_scenarios(id,name,created_at,params,summary).
-DB-ONLY scenarios — no local duplicates anywhere.
+MATH: Canadian semi-annual compounding: eff = (1+r/200)^2; periodic = eff^(1/n)-1
+DB SCHEMA: mortgage_setup (1 row), mortgage_past_renewals, mortgage_past_prepayments,
+           mortgage_scenarios, mortgage_scenario_renewals (all normalized 3NF)
 
-FIX #5 — Auto-setup: In _init_db(conn), if tables don't exist, look for setup_db.sql
-in the same folder as the script and run it via _run_sql_file() BEFORE inline IF NOT EXISTS DDL.
-This means tables are auto-created on first connect with no manual SQL needed.
+app.py sys.path.insert(0, root) ensures all submodule imports resolve correctly.
 
-============================================================
-TAB ORDER & CONTENT
-============================================================
-Tab 1 — Setup & Overview
-  Section A: Purchase Price, Down Payment %, CMHC advisory
-  Section B: Rate, Amort, Term, Start Date, Frequency, Type
-  Section C: Past Renewals (collapsable expander)
-  Section D: Past Prepayments (collapsable expander)
-  Key Metrics (9 tiles, 3 cols): Initial Principal | Balance@TermEnd | Original Amort Period
-                                  Balance Today | Principal Paid | Interest Paid
-                                  Remaining Amort (yrs + end date) | Total Interest | Current Monthly Payment
-  NO "Original Payoff" metric.
-  Charts: Donut (Principal vs Total Interest) + Stacked Bar P&I
-  Actions: Save Setup to DB | Export Wireframe (.docx)
-
-Tab 2 — Rate Change Scenarios
-  New Scenario button → expander per scenario
-  Quick Templates, Add Renewal Entry
-  Renewal rows: By Date/Period, Type, Rate, Term, Early-renewal penalty (advisory)
-  Variable sub-scenarios (a/b/c)
-  FIX #2 — Metrics layout: TWO-COLUMN green box layout side by side:
-    LEFT col:  Current Interest (base) | Current Remaining | Base Monthly Payment
-    RIGHT col: Adjusted Interest (scenario, with delta arrow) | Adjusted Remaining | Scenario Monthly Payment
-  Payment override input below metrics: editable monthly payment → Adjusted Remaining + Mortgage-free by
-  Charts: Stacked Bar P&I + Rate over time
-  Save to DB button (explicit if/else — see FIX #1)
-  Saved Scenarios section: expander per DB scenario with metrics, Load, Delete
-
-Tab 3 — Amortization Schedule
-  Scenario selector dropdown
-  View Mode: Hierarchy (default) | All Periods | Monthly Summary | Yearly Summary
-  Hierarchy: PAST (collapsed) | CURRENT last 4+today (expanded, yellow highlight) | FUTURE (blue-italic)
-  Balance + Cum Interest chart with Today vline
-  Download CSV button
-
-Tab 4 — Prepayment Analysis
-  Rate scenario base selector
-  Left col: Annual lump-sum, month, start year, years, lender limit %
-  Right col: Payment increase (Fixed$/% inc/None) + One-time lump sum
-  6 metrics: Interest (rate sc.) | Interest (+prepayments) | Remaining (rate sc.) |
-             Remaining (+prepayments) | Total New Prepaid | Interest ROI
-  Stacked Bar P&I chart
-  Save to DB button
-
-Tab 5 — Break Penalty Calculator
-  Inputs: Balance, Rate, Type, Months Remaining, Misc Fees, Posted rates (if Fixed)
-  Penalty radio: 3-Month Interest | IRD | Custom value (inline text_input)
-  4 metrics: 3 Months Interest | IRD | Penalty Applied | Total Exit Cost
-  Break-even analysis: new rate slider, 3 metrics, Net Savings vs New Rate chart
-  Monthly payment change + recoup time info bar
-
-Tab 6 — Scenario Comparison
-  2/3/4 scenario radio
-  Per-scenario column: source picker, label, rate, amort, frequency, annual lump
-  First scenario defaults to "Current Mortgage (base)"
-  Comparison table (DataFrame)
-  Balance comparison chart (date x-axis)
-  Annual P&I stacked bar by scenario
-  Best scenario callout
-  Download Fresh-Chat Prompt (.txt) button
-
-============================================================
-STACKED BAR CHART (mortgage_charts.py — stacked_bar_pi)
-============================================================
-Signature: stacked_bar_pi(df, today_p, term_end_p, title)
-x-axis: CalYear as STRING (never period numbers)
-3 segments: past=grey, current=blue/red, post=faded
-
-FIX #6 — No annotation/legend overlap:
-  legend: orientation=h, yanchor=top, y=-0.22, xanchor=center, x=0.5  ← BOTTOM
-  "Today" annotation:    y=1.06, yref="paper", bgcolor semi-transparent white
-  "Term End" annotation: y=1.13, yref="paper", bgcolor semi-transparent white
-  margin: t=55, b=115 (extra bottom room for legend)
-  No add_vline on categorical bar chart axis.
-
-============================================================
-WORD WIREFRAME (mortgage_wireframe.py)
-============================================================
-generate_wireframe_docx() using python-docx.
-Layout reference document — NO financial numbers, NO PII.
-Shows all 6 tabs as headed sections with field boxes and metric rows.
-Download button on Setup tab.
-
-============================================================
-CSS / DARK MODE (app.py global CSS)
-============================================================
-FIX #3 — All .mc, .mc-g, .mc-r, .mc-b metric tile text uses !important:
-  background: #f0f4f8 !important  (always light)
-  .mc p  → color: #1a3c5e !important
-  .mc-g p → color: #1a6b3c !important
-  .mc-r p → color: #922b21 !important
-  .mc-b p → color: #1a5276 !important
-  h3 labels also forced to dark grey (#444) !important
-.warn / .ok / .inf / .pen backgrounds also !important with dark text colours.
-
-============================================================
-BUGS FIXED (vs v7)
-============================================================
-FIX #1: Second scenario save TypeError — ternary expression
-  sc_col2.success(...) if ok else sc_col2.error(...)  ← CAUSED BUG
-  Replace with:
-    if ok:
-        sc_col2.success(...)
-    else:
-        sc_col2.error(...)
-  Root cause: Streamlit tries to iterate the return value of a ternary
-  result when it appears at statement level.
-
-FIX #2: Scenario page — base vs adjusted metrics in green tiles.
-  Show alongside each other in two columns, not just st.metric() widgets.
-
-FIX #3: Dark mode — light-background metric tiles with forced dark text.
-
-FIX #4: Modular code — see FILE STRUCTURE above.
-
-FIX #5: DB auto-setup — run setup_db.sql on first connect.
-
-FIX #6: Chart legend at bottom, annotations at y=1.06/1.13 — no overlap.
-
-============================================================
-ENTRY POINT
-============================================================
-app.py:
-  1. st.set_page_config (must be first)
-  2. Inject global CSS (with dark-mode fixes)
-  3. Import mortgage_db; initialise session_state
-  4. DB Connection Gate (calls get_db_connection which auto-creates tables)
-  5. Load saved setup if present
-  6. Render header
-  7. Create tabs list
-  8. Call each tab module: tab_setup.render(tabs), tab_scenarios.render(tabs), etc.
-
-Run with:
-  streamlit run app.py
-
-Dependencies:
-  pip install streamlit pyodbc pandas numpy plotly python-dateutil python-docx
+RUN: streamlit run app.py
