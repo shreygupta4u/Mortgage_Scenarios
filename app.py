@@ -53,7 +53,7 @@ for k, v in {"db_conn": None, "setup_loaded": False, "setup_data": None,
               "rc_scenarios": {}, "past_prepayments": [], "past_renewals": [],
               "wire_bytes": None, "sc_loaded_from_db": False,
               "pp_scenarios": {}, "pp_sc_loaded": False,
-              "_editing_sc_id": None, "_editing_pp_sc_id": None, "_dialog_shown": False}.items():
+              "_editing_sc_id": None, "_editing_pp_sc_id": None, "_dialog_shown": False, "_finalizing": False, "_fin_sc_key": None, "_fin_rn": None}.items():
     if k not in st.session_state:
         st.session_state[k] = v
 

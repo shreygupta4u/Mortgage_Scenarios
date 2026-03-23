@@ -4,10 +4,12 @@ import plotly.graph_objects as go
 from datetime import date
 import uuid
 
+from datetime import date as _date_cls
+from dateutil.relativedelta import relativedelta
 from modules import (
     calc_pmt, build_amortization,
-    db_load_scenarios, db_delete_scenario,
-    db_load_prepay_scenarios,
+    db_load_scenarios, db_delete_scenario, db_save_scenario,
+    db_load_prepay_scenarios, db_save_setup,
 )
 from pages.scenario_editor import compute_adj_scenario, edit_scenario_dialog, _get_linked_pp
 
@@ -241,9 +243,184 @@ def render_tab_scenarios(conn, b):
         st.session_state["_dialog_shown"] = True
         edit_scenario_dialog()
 
+    # ── Finalize Scenario ────────────────────────────────────────
+    _render_finalize_section(conn, b, rcs)
+
     with st.expander("📚 Canadian Mortgage Education"):
         st.markdown(
             "**Semi-annual compounding**: `(1 + r/200)²`  \n"
             "**CMHC**: <10% = 4.00% · 10–15% = 3.10% · 15–20% = 2.80% · ≥20% = nil  \n"
             "**Break penalty**: Variable = 3 months interest · Fixed = max(3mo, IRD)"
         )
+
+
+# ── Finalize helpers ──────────────────────────────────────────────
+
+@st.dialog("⚠️ Finalize Scenario — Confirm", width="large")
+def _finalize_confirm_dialog(conn, b, rcs, sc_key, finalized_rn):
+    """Confirmation popup for finalizing a scenario's first renewal."""
+    from modules import period_to_date
+    rn    = finalized_rn
+    sc    = rcs[sc_key]
+    rn_start = _date_cls.fromisoformat(rn["date_str"]) if rn.get("date_str") else b["start_date"]
+    rn_end   = rn_start + relativedelta(
+        years=int(rn["term_years"]),
+        months=int((float(rn["term_years"]) % 1) * 12),
+    )
+
+    st.markdown("### What will happen")
+    st.markdown(
+        f"**1. A new 'Additional Term' will be added to Setup:**  \n"
+        f"   &nbsp;&nbsp;Start: **{rn_start.strftime('%b %d, %Y')}** · "
+        f"Rate: **{rn['new_rate']:.2f}%** · "
+        f"Type: **{rn.get('mtype','Fixed')}** · "
+        f"Term: **{rn['term_years']} yrs** → ends **{rn_end.strftime('%b %d, %Y')}**"
+    )
+    st.markdown(
+        f"**2. Scenario '{sc['name']}' first renewal will be removed** (it becomes the base term).  \n"
+        f"**3. All OTHER scenarios:** any renewal starting before "
+        f"**{rn_end.strftime('%b %d, %Y')}** will be removed (now in the past)."
+    )
+    st.markdown(
+        f"**4. Setup will be auto-saved to DB** with the new additional term."
+    )
+    st.warning("⚠️ This action modifies the base Setup and all scenario renewal lists. It cannot be undone from the UI.")
+
+    c1, c2 = st.columns(2)
+    if c1.button("✅ Yes, Finalize", type="primary", use_container_width=True,
+                  key="fin_confirm_yes"):
+        _apply_finalize(conn, b, rcs, sc_key, rn, rn_end)
+        st.session_state["_finalizing"] = False
+        st.rerun()
+    if c2.button("✕ Cancel", use_container_width=True, key="fin_confirm_no"):
+        st.session_state["_finalizing"] = False
+        st.rerun()
+
+
+def _apply_finalize(conn, b, rcs, sc_key, finalized_rn, rn_end):
+    """Apply the finalize: update past_renewals, purge outdated renewals from all scenarios."""
+    from modules import date_to_period
+
+    rn_start = _date_cls.fromisoformat(finalized_rn["date_str"])
+
+    # ── 1. Add to past_renewals ───────────────────────────────────
+    new_past_rn = {
+        "id": str(uuid.uuid4())[:8],
+        "start_date_str": str(rn_start),
+        "rate": float(finalized_rn["new_rate"]),
+        "mtype": finalized_rn.get("mtype", "Fixed"),
+        "term_years": float(finalized_rn["term_years"]),
+    }
+    st.session_state.past_renewals.append(new_past_rn)
+
+    # ── 2. Save updated Setup to DB ───────────────────────────────
+    sd = st.session_state.setup_data or {}
+    payload = {
+        "widget_state": (sd.get("widget_state") or {}),
+        "past_renewals": st.session_state.past_renewals,
+        "past_prepayments": st.session_state.past_prepayments,
+    }
+    db_save_setup(conn, payload)
+    st.session_state.setup_data = payload
+    st.session_state.setup_loaded = True
+
+    # ── 3. Remove finalized renewal from its scenario ─────────────
+    sc = rcs.get(sc_key)
+    if sc:
+        sc["renewals"] = [
+            rn for rn in sc.get("renewals", [])
+            if rn["id"] != finalized_rn["id"]
+        ]
+        # Re-save to DB if already saved
+        if sc.get("db_id"):
+            pp_empty = {"annual_lump":0,"lump_month":1,"lump_start_year":1,"lump_num_years":0,
+                        "pay_increase_type":"None","pay_increase_val":0,"onetime_period":0,"onetime_amount":0}
+            db_save_scenario(conn, sc["db_id"], sc["name"], sc.get("desc",""),
+                             sc["renewals"], pp_empty, sc.get("user_pmt",0), sc.get("linked_pp_db_id",0))
+
+    # ── 4. Remove outdated renewals from ALL other scenarios ──────
+    for key, sc2 in list(rcs.items()):
+        if key == sc_key:
+            continue
+        before = len(sc2.get("renewals",[]))
+        sc2["renewals"] = [
+            rn for rn in sc2.get("renewals", [])
+            if not rn.get("is_terminal") and
+               _date_cls.fromisoformat(rn["date_str"]) >= rn_end
+            or rn.get("is_terminal")
+        ]
+        if sc2.get("db_id") and len(sc2["renewals"]) != before:
+            pp_empty = {"annual_lump":0,"lump_month":1,"lump_start_year":1,"lump_num_years":0,
+                        "pay_increase_type":"None","pay_increase_val":0,"onetime_period":0,"onetime_amount":0}
+            db_save_scenario(conn, sc2["db_id"], sc2["name"], sc2.get("desc",""),
+                             sc2["renewals"], pp_empty, sc2.get("user_pmt",0), sc2.get("linked_pp_db_id",0))
+
+    # ── 5. Force full reload on next render ───────────────────────
+    st.session_state["sc_loaded_from_db"] = False
+    st.success("✅ Finalized! Setup updated. Please go to **Setup & Overview** tab to confirm and re-save.")
+
+
+def _render_finalize_section(conn, b, rcs):
+    """Section at bottom of scenarios tab to pick and finalize a scenario."""
+    st.divider()
+    st.markdown("#### 🔒 Finalize a Scenario Term")
+    st.caption(
+        "Promote a scenario's **first renewal** to a confirmed base term. "
+        "It will be added to **Setup → Additional Renewal Terms** and all other scenarios "
+        "will have their now-past renewals removed automatically."
+    )
+
+    saved_scs = {k: v for k, v in rcs.items() if v.get("db_id") and v.get("renewals")}
+    non_term_by_sc = {
+        k: [rn for rn in v["renewals"] if not rn.get("is_terminal")]
+        for k, v in saved_scs.items()
+    }
+    eligible = {k: v for k, v in non_term_by_sc.items() if v}
+
+    if not eligible:
+        st.info("No saved scenarios with renewals available to finalize.")
+        return
+
+    sc_labels = {k: f"#{rcs[k].get('_seq','?')} — {rcs[k]['name']}" for k in eligible}
+    chosen_key = st.selectbox(
+        "Select scenario to finalize:",
+        list(eligible.keys()),
+        format_func=lambda k: sc_labels[k],
+        key="fin_sc_sel",
+        help="The FIRST renewal in this scenario will become a confirmed base term in Setup",
+    )
+
+    chosen_sc   = rcs[chosen_key]
+    first_rn    = eligible[chosen_key][0]
+    rn_start    = _date_cls.fromisoformat(first_rn["date_str"]) if first_rn.get("date_str") else b["start_date"]
+    rn_end_date = rn_start + relativedelta(
+        years=int(first_rn["term_years"]),
+        months=int((float(first_rn["term_years"]) % 1) * 12),
+    )
+
+    st.markdown(
+        f'<div class="inf">'
+        f'📋 First renewal of <b>{chosen_sc["name"]}</b>:  '
+        f'Starts <b>{rn_start.strftime("%b %d, %Y")}</b> · '
+        f'Rate <b>{first_rn["new_rate"]:.2f}%</b> ({first_rn.get("mtype","Fixed")}) · '
+        f'Term <b>{first_rn["term_years"]} yrs</b> → ends <b>{rn_end_date.strftime("%b %d, %Y")}</b>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    if st.button("🔒 Finalize this renewal as base term",
+                  key="btn_finalize",
+                  type="primary",
+                  help="Opens a confirmation popup before making any changes"):
+        st.session_state["_finalizing"]     = True
+        st.session_state["_fin_sc_key"]     = chosen_key
+        st.session_state["_fin_rn"]         = first_rn
+
+    if (st.session_state.get("_finalizing")
+            and st.session_state.get("_fin_sc_key")
+            and not st.session_state.get("_dialog_shown")):
+        fin_rn  = st.session_state["_fin_rn"]
+        fin_key = st.session_state["_fin_sc_key"]
+        if fin_key in rcs:
+            st.session_state["_dialog_shown"] = True
+            _finalize_confirm_dialog(conn, b, rcs, fin_key, fin_rn)

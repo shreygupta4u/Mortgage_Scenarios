@@ -238,15 +238,18 @@ def edit_scenario_dialog():
                 # Auto-show the effective start date
                 auto_d = period_to_date(rn["period"],b["start_date"],b["n_py"])
                 tc1.caption(f"Starts: **{auto_d.strftime('%b %d, %Y')}** (period {rn['period']})")
-                wkey_term = f"dlg_term_rate_{sc_id}_{rid}"
-                _seed_number(wkey_term, round(rn.get("new_rate",b["annual_rate"])*100)/100*100, default=round(b["annual_rate"]*100))
-                # number_input using the seeded state
+                # Single key — widget key = seed key (no mismatch)
+                wkey_term = f"dlg_trate_{sc_id}_{rid}"
+                if wkey_term not in st.session_state:
+                    # Seed from saved rn value (loaded from DB); fallback to last renewal rate
+                    st.session_state[wkey_term] = float(rn.get("new_rate", b["annual_rate"]))
                 rn["new_rate"] = float(tc2.number_input(
-                    "Avg Rate (%) for rest of amort",0.5,20.0,
-                    value=st.session_state[wkey_term]/100 if st.session_state[wkey_term] > 20 else float(st.session_state.get(wkey_term,rn.get("new_rate",b["annual_rate"]))),
-                    step=0.01,format="%.2f",
-                    key=f"dlg_trate_{sc_id}_{rid}",
-                    help=f"Average interest rate for the remainder of amortization after the last renewal. Defaults to last renewal rate."))
+                    "Avg Rate (%) for rest of amort", 0.5, 20.0,
+                    value=st.session_state[wkey_term],
+                    step=0.01, format="%.2f",
+                    key=wkey_term,
+                    help="Average interest rate for the remainder of amortization after the last renewal. "
+                         "Seeded from last saved value; never auto-reset."))
                 # keep term_years large to cover rest
                 rn["term_years"] = b["amort_years"]
                 if tc3.button("🗑️",key=f"dlg_del_term_{sc_id}_{rid}",help="Remove terminal entry"):
@@ -406,8 +409,13 @@ def edit_scenario_dialog():
     for rn in sc.get("renewals",[]):
         if rn.get("is_terminal") and nt2:
             last_nt2 = nt2[-1]
+            # Only update period (geometry), NEVER overwrite user's rate
             rn["period"] = int(last_nt2["period"])+int(float(last_nt2["term_years"])*b["n_py"])
-            rn["new_rate"] = last_nt2["new_rate"]
+            # Seed the widget default to last renewal rate only if widget hasn't been touched
+            rid_t = rn["id"]
+            wkey_t = f"dlg_trate_{sc_id}_{rid_t}"
+            if wkey_t not in st.session_state:
+                st.session_state[wkey_t] = float(rn.get("new_rate", last_nt2["new_rate"]))
 
     st.divider()
     ba1,ba2 = st.columns(2)
