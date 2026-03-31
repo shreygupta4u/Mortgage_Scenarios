@@ -1,1 +1,6 @@
-streamlit run app.py --server.headless true & start chrome http://localhost:8501
+@echo off
+echo Checking and installing dependencies...
+python -m pip install --quiet streamlit>=1.36.0 pandas>=2.0.0 numpy>=1.26.0 plotly>=5.18.0 python-dateutil>=2.8.2 pyodbc>=4.0.39
+echo Done. Launching app...
+python -m streamlit run "%~dp0app.py"
+pause

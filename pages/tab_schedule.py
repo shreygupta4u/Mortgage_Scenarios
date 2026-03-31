@@ -9,9 +9,35 @@ from datetime import date
 
 import plotly.graph_objects as go
 
-from modules.mortgage_math import build_amortization, _year_of
+from modules.mortgage_math import build_amortization, calc_pmt, _year_of
 from modules.mortgage_charts import _vline_x
 from modules.mortgage_db import db_load_scenarios
+from pages.scenario_editor import compute_scenario, _get_linked_pp
+
+
+def _build_schedule_df(sc, b):
+    """Build the full amortization df for a scenario, honouring user_pmt as a
+    fixed payment (not recalculated at rate renewals), consistent with the
+    scenario page display."""
+    pps_by_dbid = {
+        s["db_id"]: s
+        for s in st.session_state.get("pp_scenarios", {}).values()
+        if s.get("db_id")
+    }
+    linked_pp = _get_linked_pp(sc, pps_by_dbid)
+
+    _, _, all_rcs, sc_extra, last_rate, _ = compute_scenario(sc, b, linked_pp)
+
+    today_p  = b["today_m"].get("period_today", 0)
+    user_pmt = float(sc.get("user_pmt", 0))
+
+    df, _ = build_amortization(
+        b["principal"], b["annual_rate"], b["n_py"], b["amort_years"],
+        accel=b["accel"], start_date=b["start_date"],
+        extra_payments=sc_extra or None, rate_changes=all_rcs or None,
+        fixed_pmt=user_pmt, fixed_pmt_from=max(today_p, 1),
+    )
+    return df
 
 
 def render_tab_schedule(conn, b):
@@ -29,20 +55,23 @@ def render_tab_schedule(conn, b):
         help="Choose a saved scenario to see how the schedule changes"
     )
     if chosen_sc == "Current Setup (base rates)":
-        sc_rcs = b.get("past_renewal_rcs") or []
+        df_sch_full, _ = build_amortization(
+            b["principal"], b["annual_rate"], b["n_py"], b["amort_years"],
+            accel=b["accel"], start_date=b["start_date"],
+            extra_payments=b.get("past_extra") or None,
+            rate_changes=b.get("past_renewal_rcs") or None,
+        )
     else:
         saved = next((s for s in db_sc_list if s["name"] == chosen_sc), None)
-        sc_rcs = (b.get("past_renewal_rcs") or []) + [
-            {"period": rn["period"], "new_rate": rn["new_rate"]}
-            for rn in (saved["renewals"] if saved else [])
-        ]
-
-    df_sch_full, _ = build_amortization(
-        b["principal"], b["annual_rate"], b["n_py"], b["amort_years"],
-        accel=b["accel"], start_date=b["start_date"],
-        extra_payments=b.get("past_extra") or None,
-        rate_changes=sc_rcs or None,
-    )
+        if saved:
+            df_sch_full = _build_schedule_df(saved, b)
+        else:
+            df_sch_full, _ = build_amortization(
+                b["principal"], b["annual_rate"], b["n_py"], b["amort_years"],
+                accel=b["accel"], start_date=b["start_date"],
+                extra_payments=b.get("past_extra") or None,
+                rate_changes=b.get("past_renewal_rcs") or None,
+            )
 
     def get_ym(d):
         return d.strftime("%Y-%m") if hasattr(d, "strftime") else str(d)[:7]

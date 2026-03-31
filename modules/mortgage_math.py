@@ -101,14 +101,22 @@ def _year_of(d) -> int:
 def build_amortization(principal: float, annual_pct: float, n: int,
                        amort_years: float, accel: bool = False,
                        start_date=None, extra_payments=None,
-                       rate_changes=None, term_periods=None):
-    """Build full amortization schedule DataFrame + summary dict."""
+                       rate_changes=None, term_periods=None,
+                       fixed_pmt: float = 0, fixed_pmt_from: int = 1):
+    """Build full amortization schedule DataFrame + summary dict.
+
+    fixed_pmt      – when > 0, used as the payment for all periods >=
+                     fixed_pmt_from instead of recalculating at rate renewals.
+    fixed_pmt_from – first period that uses fixed_pmt (default 1 = always).
+    """
     if start_date is None:
         start_date = date.today().replace(day=1)
     if isinstance(start_date, str):
         start_date = date.fromisoformat(start_date)
 
     pmt = calc_pmt(principal, annual_pct, n, amort_years, accel)
+    if fixed_pmt > 0 and 1 >= fixed_pmt_from:
+        pmt = fixed_pmt
     r = periodic_rate(annual_pct, n)
 
     em = {}
@@ -137,7 +145,12 @@ def build_amortization(principal: float, annual_pct: float, n: int,
         if i in rm:
             cr = rm[i]
             cur_r = periodic_rate(cr, n)
-            pmt = calc_pmt(bal, cr, n, (tp - i + 1) / n, accel)
+            # Only recalculate pmt at renewals when NOT using a fixed payment
+            if not (fixed_pmt > 0 and i >= fixed_pmt_from):
+                pmt = calc_pmt(bal, cr, n, (tp - i + 1) / n, accel)
+        # Apply fixed payment starting from fixed_pmt_from (for the first period)
+        if fixed_pmt > 0 and i == fixed_pmt_from:
+            pmt = fixed_pmt
 
         int_c = bal * cur_r
         princ = min(max(pmt - int_c, 0), bal)
